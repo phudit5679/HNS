@@ -182,12 +182,29 @@
                if (useDrive()) {
                    // ตอนแก้ไข ใช้โฟลเดอร์เดิมที่จำไว้ (สคริปต์จะเปลี่ยนชื่อให้ตรงกับข้อมูลล่าสุด)
                    const existing = docId ? (await getDoc(docRef)).data() : null;
-                   const result = await callImageScript({
-                       action: 'save', auditId, images,
-                       folderId: existing?.driveFolderId || '',
-                       ...driveFolderNames(data.storeInfo)
-                   });
-                   await updateDoc(docRef, { imagesInDrive: true, ...(result.folderId ? { driveFolderId: result.folderId } : {}) });
+                   const folderInfo = { auditId, folderId: existing?.driveFolderId || '', ...driveFolderNames(data.storeInfo) };
+                   let folderId = '';
+                   try {
+                       folderId = (await callImageScript({ action: 'prepare', ...folderInfo })).folderId;
+                   } catch (e) {
+                       // Apps Script รุ่นเก่ายังไม่มีคำสั่ง prepare: ส่งรูปทั้งหมดในคำสั่งเดียวแบบเดิม
+                       if (!String(e.message).includes('ไม่รู้จักคำสั่ง')) throw e;
+                       folderId = (await callImageScript({ action: 'save', ...folderInfo, images })).folderId || '';
+                       folderInfo.legacy = true;
+                   }
+                   if (!folderInfo.legacy) {
+                       // ส่งรูปพร้อมกันครั้งละ 6 รูป (Apps Script รันพร้อมกันได้จำกัด)
+                       const entries = Object.entries(images);
+                       let done = 0;
+                       for (let i = 0; i < entries.length; i += 6) {
+                           await Promise.all(entries.slice(i, i + 6).map(async ([itemId, imgData]) => {
+                               await callImageScript({ action: 'upload', auditId, folderId, itemId, data: imgData });
+                               done++;
+                               if (onProgress) onProgress(`กำลังอัปโหลดรูปภาพ... (${done}/${entries.length})\nกรุณาอย่าปิดหน้าจอ`);
+                           }));
+                       }
+                   }
+                   await updateDoc(docRef, { imagesInDrive: true, ...(folderId ? { driveFolderId: folderId } : {}) });
                    // ลบรูปที่อาจค้างอยู่ใน Firebase จากการบันทึกรุ่นก่อน
                    await saveImages(db, appId, auditId, {});
                } else {

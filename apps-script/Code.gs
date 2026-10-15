@@ -18,6 +18,8 @@ function doPost(e) {
     if (!/^[A-Za-z0-9_-]+$/.test(req.auditId || '')) return reply({ ok: false, error: 'auditId ไม่ถูกต้อง' });
 
     const root = DriveApp.getFolderById(FOLDER_ID);
+    if (req.action === 'prepare') return reply(prepareFolder(root, req));
+    if (req.action === 'upload') return reply(uploadImage(req));
     if (req.action === 'save') return reply(saveImages(root, req));
     if (req.action === 'load') return reply(loadImages(root, req));
     if (req.action === 'delete') return reply(deleteImages(root, req));
@@ -45,7 +47,34 @@ function getOrCreateFolder(parent, name) {
   return folders.hasNext() ? folders.next() : parent.createFolder(name);
 }
 
-// แทนที่รูปทั้งหมดของผลการตรวจนี้ด้วยชุดใหม่ (ใช้ได้ทั้งบันทึกใหม่และแก้ไข)
+// ขั้นที่ 1: เตรียมโฟลเดอร์ (สร้างใหม่ หรือใช้ของเดิมแล้วล้างรูปเก่า)
+// แยกขั้นตอนเพื่อให้เว็บส่งรูปหลายรูปพร้อมกันในขั้นที่ 2 ได้ เร็วกว่าส่งทีละรูป
+function prepareFolder(root, req) {
+  const folderName = String(req.folderName || req.auditId).slice(0, 200);
+  const parent = req.monthFolderName ? getOrCreateFolder(root, String(req.monthFolderName).slice(0, 100)) : root;
+
+  let folder = findAuditFolder(root, req);
+  if (folder) {
+    folder.setName(folderName);
+    folder.moveTo(parent);
+    const oldFiles = folder.getFiles();
+    while (oldFiles.hasNext()) oldFiles.next().setTrashed(true);
+  } else {
+    folder = parent.createFolder(folderName);
+  }
+  return { ok: true, folderId: folder.getId() };
+}
+
+// ขั้นที่ 2: บันทึกรูป 1 รูปลงโฟลเดอร์ที่เตรียมไว้
+function uploadImage(req) {
+  const match = String(req.data || '').match(/^data:(image\/[a-z]+);base64,(.+)$/);
+  if (!match) return { ok: false, error: 'ข้อมูลรูปไม่ถูกต้อง' };
+  const folder = DriveApp.getFolderById(req.folderId);
+  folder.createFile(Utilities.newBlob(Utilities.base64Decode(match[2]), match[1], String(req.itemId) + '.jpg'));
+  return { ok: true };
+}
+
+// แบบเดิม (ส่งรูปทั้งหมดในคำสั่งเดียว) เก็บไว้เผื่อเว็บรุ่นเก่ายังเรียกใช้
 function saveImages(root, req) {
   const folderName = String(req.folderName || req.auditId).slice(0, 200);
   const parent = req.monthFolderName ? getOrCreateFolder(root, String(req.monthFolderName).slice(0, 100)) : root;
