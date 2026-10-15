@@ -101,8 +101,8 @@
         // ====== ตั้งค่าที่เก็บรูปบน Google Drive (ผ่าน Google Apps Script) ======
         // วางลิงก์ Web app ของ Apps Script และรหัสลับ (TOKEN) ให้ตรงกับในสคริปต์
         // ถ้าเว้นว่างไว้ ระบบจะเก็บรูปใน Firebase แบบเดิม
-        const IMAGE_SCRIPT_URL = '';
-        const IMAGE_SCRIPT_TOKEN = '';
+        const IMAGE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxNmJYWHz16TZgFhLdJjgvfq-ymnBsWHitG8aFSmpoqJs_YPoVJit6vU1yAazXbhUj-/exec';
+        const IMAGE_SCRIPT_TOKEN = 'hns-audit-2407657';
         const useDrive = () => IMAGE_SCRIPT_URL !== '' && IMAGE_SCRIPT_TOKEN !== '';
 
         // ส่งเป็น text/plain เพื่อไม่ให้เบราว์เซอร์ส่ง preflight ซึ่ง Apps Script ไม่รองรับ
