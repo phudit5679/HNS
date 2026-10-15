@@ -1431,9 +1431,11 @@
                         localStorage.removeItem('cafe_audit_draft');
                         lastCloudSaveRef.current = getDataFingerprint({ storeInfo, scores, remarks, measurements, checkedItems, signatures, images });
                         setHasDraft(false);
+                        setIsSaving(false);
                         setModalInfo({ show: true, message: 'อัปโหลดไฟล์และบันทึกข้อมูลสำเร็จ!', isError: false });
                         setEditingId(null);
-                        await loadAuditHistory(true);
+                        // ไม่รอโหลดประวัติทั้งหมดตรงนี้ (ช้าเมื่อข้อมูลเยอะ) แต่ให้โหลดใหม่ตอนเปิดหน้าสรุปภาพรวม/วิเคราะห์
+                        setIsDataLoaded(false);
                     } else throw new Error("ระบบฐานข้อมูลยังไม่พร้อมใช้งาน");
                 } catch (error) {
                     setModalInfo({ show: true, message: `เกิดข้อผิดพลาด: ${error.message}`, isError: true });
