@@ -106,24 +106,46 @@
         const useDrive = () => IMAGE_SCRIPT_URL !== '' && IMAGE_SCRIPT_TOKEN !== '';
 
         // ส่งเป็น text/plain เพื่อไม่ให้เบราว์เซอร์ส่ง preflight ซึ่ง Apps Script ไม่รองรับ
-        const callImageScript = async (payload) => {
-            const res = await fetch(IMAGE_SCRIPT_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                body: JSON.stringify({ ...payload, token: IMAGE_SCRIPT_TOKEN })
-            });
+        const callImageScriptOnce = async (payload) => {
+            let res;
+            try {
+                res = await fetch(IMAGE_SCRIPT_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify({ ...payload, token: IMAGE_SCRIPT_TOKEN })
+                });
+            } catch (e) {
+                const err = new Error(`เชื่อมต่อ Google Drive ไม่ได้ (${e.message}) กรุณาเช็กสัญญาณอินเทอร์เน็ต`);
+                err.transient = true;
+                throw err;
+            }
             const text = await res.text();
             let result;
             try {
                 result = JSON.parse(text);
             } catch (e) {
-                // Apps Script ตอบเป็นหน้าเว็บแทน JSON: สคริปต์มี error, ยังไม่ได้ Authorize, หรือตั้งสิทธิ์ไม่เป็น Anyone
+                // Apps Script ตอบเป็นหน้าเว็บแทน JSON: Google ขัดข้องชั่วคราว, สคริปต์มี error, ยังไม่ได้ Authorize หรือตั้งสิทธิ์ไม่เป็น Anyone
                 const page = new DOMParser().parseFromString(text, 'text/html');
                 const detail = (page.querySelector('.errorMessage')?.textContent || page.title || page.body?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200);
-                throw new Error(`Google Drive (Apps Script) ตอบกลับผิดรูปแบบ: ${detail || `HTTP ${res.status}`}\nกรุณาเช็ก Apps Script → การดำเนินการ (Executions)`);
+                const err = new Error(`Google Drive (Apps Script) ตอบกลับผิดรูปแบบ: ${detail || `HTTP ${res.status}`}\nกรุณาเช็ก Apps Script → การดำเนินการ (Executions)`);
+                err.transient = true;
+                throw err;
             }
             if (!result.ok) throw new Error(`Google Drive: ${result.error || 'ไม่ทราบสาเหตุ'}`);
             return result;
+        };
+
+        // Apps Script บริการฟรีขัดข้องชั่วคราวได้บ้าง (เช่น ตอนเพิ่งตื่นจากการพัก) จึงลองใหม่อัตโนมัติสูงสุด 2 ครั้ง
+        // ไม่ลองใหม่เมื่อสคริปต์ตอบ error ชัดเจน (เช่น รหัสลับผิด) เพราะลองกี่ครั้งก็ไม่ผ่าน
+        const callImageScript = async (payload) => {
+            for (let attempt = 0; ; attempt++) {
+                try {
+                    return await callImageScriptOnce(payload);
+                } catch (e) {
+                    if (!e.transient || attempt >= 2) throw e;
+                    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+                }
+            }
         };
 
         // ชื่อโฟลเดอร์ใน Drive: "2569-10 ต.ค." / "S001 สาขาบางนา 15-10-2569"
