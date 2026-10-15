@@ -112,7 +112,16 @@
                 headers: { 'Content-Type': 'text/plain;charset=utf-8' },
                 body: JSON.stringify({ ...payload, token: IMAGE_SCRIPT_TOKEN })
             });
-            const result = await res.json();
+            const text = await res.text();
+            let result;
+            try {
+                result = JSON.parse(text);
+            } catch (e) {
+                // Apps Script ตอบเป็นหน้าเว็บแทน JSON: สคริปต์มี error, ยังไม่ได้ Authorize, หรือตั้งสิทธิ์ไม่เป็น Anyone
+                const page = new DOMParser().parseFromString(text, 'text/html');
+                const detail = (page.querySelector('.errorMessage')?.textContent || page.title || page.body?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+                throw new Error(`Google Drive (Apps Script) ตอบกลับผิดรูปแบบ: ${detail || `HTTP ${res.status}`}\nกรุณาเช็ก Apps Script → การดำเนินการ (Executions)`);
+            }
             if (!result.ok) throw new Error(`Google Drive: ${result.error || 'ไม่ทราบสาเหตุ'}`);
             return result;
         };
