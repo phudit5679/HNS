@@ -76,6 +76,22 @@
         .pdf-mode img { display: inline-block !important; }
         .pdf-mode textarea { white-space: pre-wrap !important; word-break: break-word !important; }
         .pdf-mode * { letter-spacing: normal !important; }
+
+        /* เพิ่ม CSS อนิเมชันสำหรับกระพริบแจ้งเตือน */
+        @keyframes pulse-error {
+            0%, 100% { background-color: transparent; outline: 2px solid transparent; }
+            50% { background-color: #fee2e2; outline: 3px solid #ef4444; outline-offset: -2px; }
+        }
+        .error-flash {
+            animation: pulse-error 0.6s ease-in-out 4 !important; /* กระพริบ 4 ครั้ง */
+            border-radius: 8px;
+            position: relative;
+            z-index: 10;
+        }
+        /* บังคับให้พื้นหลังลูกโปร่งใสชั่วคราว เพื่อให้เห็นสีแดง */
+        .error-flash td, .error-flash div {
+            background-color: transparent !important;
+        }
     </style>
 
     <script type="module">
@@ -111,25 +127,29 @@
             await Promise.all(Object.entries(images).map(([itemId, data]) => setDoc(doc(col, itemId), { data })));
         };
 
-        window.initFirebaseAndSave = async (data, docId = null, images = {}) => {
+        window.initFirebaseAndSave = async (data, docId = null, images = {}, onProgress = null) => {
             try {
                const { db, userId, appId } = await getFirebaseInstances();
                if (!db) throw new Error("ไม่สามารถเชื่อมต่อฐานข้อมูลได้");
 
                // ล้างรูปเก่าที่เคยฝังอยู่ในเอกสารหลัก (ข้อมูลรุ่นก่อน) ให้ไปอยู่ใน subcollection แทน
                const body = { ...data, images: {} };
+               const imageCount = Object.keys(images).length;
 
+               if (onProgress) onProgress('กำลังบันทึกข้อมูลคะแนนลงระบบ...');
+               let auditId = docId;
                if (docId) {
                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'audits', docId);
                    await updateDoc(docRef, { ...body, updatedBy: userId, updatedAt: new Date().toISOString() });
-                   await saveImages(db, appId, docId, images);
-                   return docId;
                } else {
                    const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'audits');
                    const ref = await addDoc(colRef, { ...body, submittedBy: userId });
-                   await saveImages(db, appId, ref.id, images);
-                   return ref.id;
+                   auditId = ref.id;
                }
+
+               if (onProgress) onProgress(`กำลังอัปโหลดรูปภาพ (${imageCount} รูป)...\nกรุณาอย่าปิดหน้าจอ`);
+               await saveImages(db, appId, auditId, images);
+               return auditId;
             } catch (error) {
                console.error("Firebase Save Error:", error);
                throw error;
@@ -559,6 +579,57 @@
             const [isSaving, setIsSaving] = React.useState(false);
             const [modalInfo, setModalInfo] = React.useState({ show: false, message: '', isError: false });
             const [hasDraft, setHasDraft] = React.useState(false);
+            const [isDataLoaded, setIsDataLoaded] = React.useState(false);
+
+            const [lastAutoSave, setLastAutoSave] = React.useState(null);
+
+            const latestDataRef = React.useRef({ storeInfo, scores, remarks, measurements, checkedItems, signatures, images, auditStartTime, editingId });
+            // ลายนิ้วมือของข้อมูลที่บันทึกขึ้น Cloud ล่าสุด ใช้กัน Auto Save สร้าง draft ซ้ำหลังบันทึกสำเร็จ
+            const lastCloudSaveRef = React.useRef(null);
+            const getDataFingerprint = (d) => JSON.stringify([d.storeInfo, d.scores, d.remarks, d.measurements, d.checkedItems, Object.keys(d.images).sort(), !!d.signatures.manager, !!d.signatures.auditor]);
+
+            // อัปเดตข้อมูลล่าสุดเก็บไว้ใน Ref เพื่อให้ Auto Save เอาไปใช้ได้โดยไม่ต้องรีเซ็ตเวลาใหม่ทุกครั้งที่พิมพ์
+            React.useEffect(() => {
+                latestDataRef.current = { storeInfo, scores, remarks, measurements, checkedItems, signatures, images, auditStartTime, editingId };
+            }, [storeInfo, scores, remarks, measurements, checkedItems, signatures, images, auditStartTime, editingId]);
+
+            // ระบบ Auto Save ทำงานทุก 15 วินาที (และครั้งแรกทำงานเมื่อผ่านไป 10 วินาที)
+            React.useEffect(() => {
+                const performAutoSave = () => {
+                    const data = latestDataRef.current;
+                    // ไม่บันทึกถ้าเป็นโหมดดูข้อมูล
+                    if (viewingRecord) return;
+
+                    // เช็คว่ามีข้อมูลอะไรให้เซฟไหม (อนุญาตให้เซฟได้แม้ยังไม่ได้กรอกรหัสสาขา)
+                    const hasData = data.storeInfo.code !== '' || Object.keys(data.scores).length > 0 || Object.keys(data.images).length > 0;
+                    if (!hasData) return;
+
+                    // ข้อมูลเหมือนที่เพิ่งบันทึกขึ้น Cloud แล้ว ไม่ต้องเก็บ draft ซ้ำ
+                    if (lastCloudSaveRef.current && lastCloudSaveRef.current === getDataFingerprint(data)) return;
+
+                    try {
+                        const draftData = { ...data, timestamp: new Date().toISOString() };
+                        localStorage.setItem('cafe_audit_draft', JSON.stringify(draftData));
+
+                        const now = new Date();
+                        setLastAutoSave(`${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`);
+                        setHasDraft(true);
+                    } catch (error) {
+                        console.warn("Auto-save failed (Storage limit reached)");
+                    }
+                };
+
+                // เรียกใช้ครั้งแรกให้เร็วขึ้น
+                const initialSave = setTimeout(performAutoSave, 10000);
+
+                // วนลูปทำงานทุก 15 วินาที
+                const interval = setInterval(performAutoSave, 15000);
+
+                return () => {
+                    clearTimeout(initialSave);
+                    clearInterval(interval);
+                };
+            }, [viewingRecord]);
 
             const dragRef = React.useRef({ isDragging: false, startX: 0, startY: 0, initMenuX: 0, initMenuY: 0, moved: false });
 
@@ -678,12 +749,6 @@
             }, []);
 
             React.useEffect(() => {
-                if (currentView === 'dashboard' && !viewingRecord) {
-                    loadAuditHistory();
-                }
-            }, [currentView, viewingRecord]);
-
-            React.useEffect(() => {
                 const draft = localStorage.getItem('cafe_audit_draft');
                 if (draft) setHasDraft(true);
             }, []);
@@ -692,14 +757,22 @@
                 setCurrentPage(1);
             }, [filterMonth, filterSearch, filterDept, filterRegion, filterScore, filterStatus]);
 
-            const loadAuditHistory = async () => {
+            const loadAuditHistory = async (forceRefresh = false) => {
+                if (isDataLoaded && !forceRefresh) return;
                 setIsLoadingHistory(true);
                 if (window.fetchAuditHistory) {
                     const data = await window.fetchAuditHistory();
                     setAuditHistory(data);
+                    setIsDataLoaded(true);
                 }
                 setIsLoadingHistory(false);
             };
+
+            React.useEffect(() => {
+                if ((currentView === 'dashboard' || currentView === 'analysis') && !viewingRecord && !isDataLoaded) {
+                    loadAuditHistory();
+                }
+            }, [currentView, viewingRecord, isDataLoaded]);
 
             // ดึงรูปของผลการตรวจจาก subcollection (รองรับข้อมูลเก่าที่เก็บรูปไว้ในเอกสารหลักด้วย)
             const loadRecordImages = async (record) => {
@@ -1309,23 +1382,27 @@
 
                 if (missingItems.length > 0 || missingImages.length > 0 || missingManagerSig || missingAuditorSig){
                   let errorMsg = '';
+                  let targetId = null;
                     if (missingItems.length > 0){
+                        targetId = `row-${missingItems[0]}`;
                         const displayItems = missingItems.slice(0,15);
                         const moreCount = missingItems.length - 15;
                         errorMsg += `❌ กรุณาระบุคะแนนให้ครบทุกข้อ\nข้อที่ยังไม่ได้ระบุคะแนน: ${displayItems.join(', ')}`;
                         if (moreCount > 0)errorMsg += `\n...และข้ออื่นๆ อีก ${moreCount} ข้อ`;
                     }
                     if (missingImages.length > 0) {
+                        if (!targetId) targetId = `row-${missingImages[0]}`;
                         if (errorMsg) errorMsg += '\n\n-----------------------\n\n';
                         errorMsg += `📸 กรุณาแนบรูปภาพในข้อบังคับให้ครบถ้วน\nข้อที่ยังไม่ได้แนบรูป: ${missingImages.join(', ')}`;
                     }
                     if (missingManagerSig || missingAuditorSig) {
+                        if (!targetId) targetId = 'section-signature';
                         if (errorMsg) errorMsg += '\n\n-----------------------\n\n';
                         errorMsg += `✍️ กรุณาลงลายมือชื่อให้ครบถ้วน\n`;
                         if (missingManagerSig) errorMsg += `- ผู้จัดการร้านสาขา (ผู้รับทราบ)\n`;
                         if (missingAuditorSig) errorMsg += `- ผู้จัดการเขต (ผู้ตรวจ)`;
                     }
-                    setModalInfo({ show: true, message: errorMsg, isError: true });
+                    setModalInfo({ show: true, message: errorMsg, isError: true, targetId: targetId });
                     return;
                 }
 
@@ -1347,11 +1424,16 @@
                         timeTaken: timeTakenStr, durationSeconds: durationSec
                     };
                     if (window.initFirebaseAndSave) {
-                        await window.initFirebaseAndSave(payload, editingId, images);
+                        // ส่ง Callback function ไปให้ initFirebaseAndSave เพื่ออัปเดตหน้าจอแบบ Real-time
+                        await window.initFirebaseAndSave(payload, editingId, images, (progressMsg) => {
+                            setModalInfo({ show: true, message: progressMsg, isError: false });
+                        });
                         localStorage.removeItem('cafe_audit_draft');
+                        lastCloudSaveRef.current = getDataFingerprint({ storeInfo, scores, remarks, measurements, checkedItems, signatures, images });
                         setHasDraft(false);
-                        setModalInfo({ show: true, message: 'บันทึกข้อมูลลงฐานข้อมูลเรียบร้อยแล้ว!', isError: false });
+                        setModalInfo({ show: true, message: 'อัปโหลดไฟล์และบันทึกข้อมูลสำเร็จ!', isError: false });
                         setEditingId(null);
+                        await loadAuditHistory(true);
                     } else throw new Error("ระบบฐานข้อมูลยังไม่พร้อมใช้งาน");
                 } catch (error) {
                     setModalInfo({ show: true, message: `เกิดข้อผิดพลาด: ${error.message}`, isError: true });
@@ -1485,7 +1567,7 @@
                 try {
                     if (window.deleteAuditRecord) {
                         await window.deleteAuditRecord(deleteConfirm.docId);
-                        await loadAuditHistory();
+                        await loadAuditHistory(true);
                         setModalInfo({ show: true, message: 'ลบข้อมูลสำเร็จ', isError: false });
                     }
                 } catch (error) {
@@ -2105,7 +2187,13 @@
                 return (
                     <div className="w-full max-w-7xl mx-auto p-4 py-8">
                         <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 mb-6">
-                            <h2 className="text-xl font-extrabold text-gray-800 mb-4">สรุปผลการตรวจสอบ</h2>
+                            <div className="flex justify-between items-center mb-4">
+                                <h2 className="text-xl font-extrabold text-gray-800">สรุปผลการตรวจสอบ</h2>
+                                <button onClick={() => loadAuditHistory(true)} disabled={isLoadingHistory} className="flex items-center gap-1.5 text-sm bg-blue-50 text-blue-700 px-3.5 py-2 rounded-lg border border-blue-200 hover:bg-blue-100 transition shadow-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed">
+                                    <svg className={`w-4 h-4 ${isLoadingHistory ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                                    {isLoadingHistory ? 'กำลังโหลด...' : 'รีเฟรชข้อมูล'}
+                                </button>
+                            </div>
 
                             <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
                                 <div className="bg-gray-50 border border-gray-200 p-4 rounded-xl flex items-center justify-between shadow-sm">
@@ -2584,46 +2672,7 @@
                             </div>
                         </div>
 
-                        {/* 1. แจ้งเตือนร้ายแรง */}
-                        {analysisData.criticalAlerts.length > 0 && (
-                            <div className="bg-red-50 rounded-xl shadow-sm border-2 border-red-300 p-5 md:p-6 relative overflow-hidden">
-                                <div className="absolute top-0 right-0 p-4 opacity-10">
-                                    <svg className="w-32 h-32 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-                                </div>
-                                <div className="flex items-center gap-3 mb-6 relative z-10">
-                                    <div className="bg-red-600 p-2.5 rounded-xl shadow-md">
-                                        <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-                                    </div>
-                                    <div>
-                                        <h2 className="text-xl font-extrabold text-red-700">แจ้งเตือน! พบข้อบกพร่องร้ายแรง (Zero-Tolerance)</h2>
-                                        <p className="text-sm text-red-600 font-medium">สาขาที่พบปัญหา: ของหมดอายุ / สัตว์พาหะ / ใบอนุญาต</p>
-                                    </div>
-                                </div>
-                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 relative z-10">
-                                    {analysisData.criticalAlerts.map((store, idx) => (
-                                        <div key={idx} className="bg-white rounded-lg p-3 border border-red-200 shadow-sm flex flex-col gap-2">
-                                            <div>
-                                                <div className="font-bold text-red-700 text-lg leading-tight">{store.code}</div>
-                                                <div className="font-bold text-gray-800 text-sm">{store.name}</div>
-                                                <div className="text-[10px] text-gray-500 mt-0.5">{store.dept} | {store.zone}</div>
-                                            </div>
-                                            <div className="bg-red-50 p-2 rounded border border-red-100 flex-1">
-                                                <ul className="list-disc pl-4 space-y-1">
-                                                    {store.issues.map((issue, i) => (
-                                                        <li key={i} className="text-xs text-red-600 font-bold leading-snug">
-                                                            {issue.tag && <span className="block text-[10px] bg-red-100 text-red-800 px-1.5 py-0.5 rounded border border-red-200 w-fit mb-0.5">{issue.tag}</span>}
-                                                            {issue.desc}
-                                                        </li>
-                                                    ))}
-                                                </ul>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-
-                        {/* 2. สัดส่วนเกรดสาขา (Score Distribution) */}
+                        {/* 1. สัดส่วนเกรดสาขา (Score Distribution) - ย้ายขึ้นมาก่อน */}
                         <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-5 md:p-6 flex flex-col">
                             <h2 className="text-lg font-extrabold text-gray-800 mb-1">สัดส่วนเกรดของสาขา</h2>
                             <p className="text-xs text-gray-500 mb-4">เกณฑ์พิจารณาจากผลคะแนนรวมรอบล่าสุด</p>
@@ -2696,6 +2745,45 @@
                                 </div>
                             )}
                         </div>
+
+                        {/* 2. แจ้งเตือนร้ายแรง - ย้ายลงมาต่อจากสัดส่วนเกรด */}
+                        {analysisData.criticalAlerts.length > 0 && (
+                            <div className="bg-red-50 rounded-xl shadow-sm border-2 border-red-300 p-5 md:p-6 relative overflow-hidden">
+                                <div className="absolute top-0 right-0 p-4 opacity-10">
+                                    <svg className="w-32 h-32 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                </div>
+                                <div className="flex items-center gap-3 mb-6 relative z-10">
+                                    <div className="bg-red-600 p-2.5 rounded-xl shadow-md">
+                                        <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                                    </div>
+                                    <div>
+                                        <h2 className="text-xl font-extrabold text-red-700">แจ้งเตือน! พบข้อบกพร่องร้ายแรง (Zero-Tolerance)</h2>
+                                        <p className="text-sm text-red-600 font-medium">สาขาที่พบปัญหา: ของหมดอายุ / สัตว์พาหะ / ใบอนุญาต</p>
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 relative z-10">
+                                    {analysisData.criticalAlerts.map((store, idx) => (
+                                        <div key={idx} className="bg-white rounded-lg p-3 border border-red-200 shadow-sm flex flex-col gap-2">
+                                            <div>
+                                                <div className="font-bold text-red-700 text-lg leading-tight">{store.code}</div>
+                                                <div className="font-bold text-gray-800 text-sm">{store.name}</div>
+                                                <div className="text-[10px] text-gray-500 mt-0.5">{store.dept} | {store.zone}</div>
+                                            </div>
+                                            <div className="bg-red-50 p-2 rounded border border-red-100 flex-1">
+                                                <ul className="list-disc pl-4 space-y-1">
+                                                    {store.issues.map((issue, i) => (
+                                                        <li key={i} className="text-xs text-red-600 font-bold leading-snug">
+                                                            {issue.tag && <span className="block text-[10px] bg-red-100 text-red-800 px-1.5 py-0.5 rounded border border-red-200 w-fit mb-0.5">{issue.tag}</span>}
+                                                            {issue.desc}
+                                                        </li>
+                                                    ))}
+                                                </ul>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
 
                         {/* 3. Top 5 ข้อบกพร่องยอดฮิต & พัฒนาการรายเดือน */}
                         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -3015,10 +3103,39 @@
                     {/* ย้าย Pop-up แจ้งเตือนและยืนยันการลบมาไว้ด้านนอกสุด เพื่อให้แสดงผลได้ในทุกหน้า (ทั้ง Dashboard และ Form) */}
                     {modalInfo.show && (
                         <div className="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50 px-4">
-                            <div className="bg-white p-6 md:p-8 rounded-xl shadow-2xl max-w-sm w-full text-center border-t-8 border-yellow-400">
-                                <div className={`text-5xl mb-4 ${modalInfo.isError ? 'text-red-500' : 'text-green-500'}`}>{modalInfo.isError ? '❌' : (isSaving ? '⏳' : '✅')}</div>
+                            <div className="bg-white p-6 md:p-8 rounded-xl shadow-2xl max-w-sm w-full text-center border-t-8 border-yellow-400 relative">
+                                {/* ปุ่ม X ปิดหน้าต่าง (ซ่อนระหว่างกำลังบันทึก กันผู้ใช้ปิดแล้วกดส่งซ้ำจนข้อมูลซ้ำ) */}
+                                {!isSaving && (
+                                    <button onClick={() => setModalInfo({ show: false, message: '', isError: false })} className="absolute top-3 right-3 text-gray-400 hover:text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-full p-2 transition-colors">
+                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                    </button>
+                                )}
+
+                                <div className={`text-5xl mb-4 mt-2 ${modalInfo.isError ? 'text-red-500' : 'text-green-500'}`}>{modalInfo.isError ? '❌' : (isSaving ? '⏳' : '✅')}</div>
                                 <h3 className="text-lg font-bold text-gray-800 mb-3 whitespace-pre-line leading-relaxed">{modalInfo.message}</h3>
-                                {!isSaving && (<button onClick={() => setModalInfo({ show: false, message: '', isError: false })} className="mt-6 bg-yellow-400 hover:bg-yellow-500 text-gray-900 font-extrabold py-3 md:py-2.5 px-6 rounded-lg w-full transition shadow-md">ตกลง (ปิดหน้าต่าง)</button>)}
+                                {!isSaving && (
+                                    <button onClick={() => {
+                                        setModalInfo({ show: false, message: '', isError: false });
+                                        if (modalInfo.targetId) {
+                                            setTimeout(() => {
+                                                const el = document.getElementById(modalInfo.targetId);
+                                                if (el) {
+                                                    // ปรับจุดกึ่งกลางของหน้าจอให้อ่านง่ายขึ้นเวลาเลื่อนลงมา
+                                                    const y = el.getBoundingClientRect().top + window.pageYOffset - 150;
+                                                    window.scrollTo({top: y, behavior: 'smooth'});
+
+                                                    // ใส่คลาสกระพริบสีแดง
+                                                    el.classList.add('error-flash');
+
+                                                    // เอาออกเมื่อกระพริบเสร็จ (ประมาณ 2.5 วินาที)
+                                                    setTimeout(() => el.classList.remove('error-flash'), 2500);
+                                                }
+                                            }, 150);
+                                        }
+                                    }} className="mt-6 bg-yellow-400 hover:bg-yellow-500 text-gray-900 font-extrabold py-3 md:py-2.5 px-6 rounded-lg w-full transition shadow-md">
+                                        ตกลง (ปิดหน้าต่าง)
+                                    </button>
+                                )}
                             </div>
                         </div>
                     )}
@@ -3169,7 +3286,7 @@
                         {!viewingRecord && currentView === 'form' && (
                             <button
                                 onClick={saveDraft}
-                                className="fixed z-50 no-print bottom-4 left-4 md:bottom-6 md:left-6 bg-white hover:bg-yellow-50 text-gray-800 rounded-2xl p-2.5 md:p-3 shadow-2xl flex items-center justify-center transition-transform hover:scale-105 active:scale-95 border border-yellow-300"
+                                className="fixed z-50 no-print bottom-4 left-4 md:bottom-6 md:left-6 bg-white hover:bg-yellow-50 text-gray-800 rounded-2xl p-2.5 md:p-3 shadow-2xl flex flex-col items-center justify-center transition-transform hover:scale-105 active:scale-95 border border-yellow-300"
                                 style={{ boxShadow: '0 4px 14px 0 rgba(234, 179, 8, 0.3)' }}
                                 title="บันทึกชั่วคราว (Save Draft)"
                             >
@@ -3179,9 +3296,14 @@
                                     </div>
                                     <div className="flex flex-col items-start pr-1 md:pr-2">
                                         <span className="text-[11px] md:text-xs font-extrabold text-gray-800 leading-tight">บันทึกชั่วคราว</span>
-                                        <span className="text-[9px] text-gray-500 font-medium hidden md:block">เก็บลงเครื่อง</span>
+                                        <span className="text-[9px] text-gray-500 font-medium hidden md:block">เก็บลงเครื่องแบบแมนนวล</span>
                                     </div>
                                 </div>
+                                {lastAutoSave && (
+                                    <div className="mt-1.5 pt-1.5 border-t border-gray-100 w-full text-center">
+                                        <span className="text-[9px] text-green-600 font-bold block animate-pulse">✓ ออโต้เซฟล่าสุด {lastAutoSave}</span>
+                                    </div>
+                                )}
                             </button>
                         )}
 
@@ -3194,6 +3316,13 @@
                                     <h1 className="text-xl md:text-4xl font-extrabold text-gray-900 mb-2 leading-tight">แบบฟอร์มตรวจสอบคุณภาพร้าน Café Amazon</h1>
                                     <p className="text-gray-500 font-medium text-sm md:text-lg">Quality Assurance Audit Form</p>
                                 </div>
+                                
+                                {/* ปุ่มสุ่มข้อมูลทดสอบ แสดงเฉพาะเมื่อเปิดลิงก์ที่มี ?test=1 เท่านั้น ผู้ใช้ทั่วไปจะไม่เห็น */}
+                                {!viewingRecord && new URLSearchParams(window.location.search).has('test') && (
+                                    <button onClick={fillMockData} className="no-print mt-5 bg-indigo-50 hover:bg-indigo-100 text-indigo-700 font-bold py-2 px-5 rounded-full text-sm transition-all shadow-sm border border-indigo-200 flex items-center gap-2 mx-auto">
+                                        <span className="text-lg">🧪</span> สุ่มข้อมูลสำหรับทดสอบระบบ (Test Data)
+                                    </button>
+                                )}
                             </div>
 
                             <div id="section-info" className="mb-6 md:mb-10 bg-yellow-50 p-3 md:p-6 rounded-none md:rounded-xl border-l-4 md:border-l-8 border-yellow-400 shadow-sm scroll-mt-6 w-full">
