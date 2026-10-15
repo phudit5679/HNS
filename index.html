@@ -96,7 +96,37 @@
 
     <script type="module">
         import { initializeApp, getApps, getApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-        import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, setDoc } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, getDocs, getDoc, doc, updateDoc, deleteDoc, setDoc, query, where } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+        // ====== ตั้งค่าที่เก็บรูปบน Google Drive (ผ่าน Google Apps Script) ======
+        // วางลิงก์ Web app ของ Apps Script และรหัสลับ (TOKEN) ให้ตรงกับในสคริปต์
+        // ถ้าเว้นว่างไว้ ระบบจะเก็บรูปใน Firebase แบบเดิม
+        const IMAGE_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxNmJYWHz16TZgFhLdJjgvfq-ymnBsWHitG8aFSmpoqJs_YPoVJit6vU1yAazXbhUj-/exec';
+        const IMAGE_SCRIPT_TOKEN = 'hns-audit-2407657';
+        const useDrive = () => IMAGE_SCRIPT_URL !== '' && IMAGE_SCRIPT_TOKEN !== '';
+
+        // ส่งเป็น text/plain เพื่อไม่ให้เบราว์เซอร์ส่ง preflight ซึ่ง Apps Script ไม่รองรับ
+        const callImageScript = async (payload) => {
+            const res = await fetch(IMAGE_SCRIPT_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                body: JSON.stringify({ ...payload, token: IMAGE_SCRIPT_TOKEN })
+            });
+            const result = await res.json();
+            if (!result.ok) throw new Error(`Google Drive: ${result.error || 'ไม่ทราบสาเหตุ'}`);
+            return result;
+        };
+
+        // ชื่อโฟลเดอร์ใน Drive: "2569-10 ต.ค." / "S001 สาขาบางนา 15-10-2569"
+        const THAI_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+        const driveFolderNames = (storeInfo = {}) => {
+            const [y, m, d] = String(storeInfo.date || '').split('-');
+            const thaiYear = y ? parseInt(y, 10) + 543 : '';
+            const folderName = [storeInfo.code, storeInfo.name, d && m ? `${d}-${m}-${thaiYear}` : '']
+                .filter(Boolean).join(' ').replace(/[\\/]/g, '-');
+            const monthFolderName = y && m ? `${thaiYear}-${m} ${THAI_MONTHS[parseInt(m, 10) - 1]}` : '';
+            return { folderName, monthFolderName };
+        };
 
         const getFirebaseInstances = async () => {
             const firebaseConfig = {
@@ -117,7 +147,7 @@
             return { db, userId, appId: firebaseConfig.appId };
         };
 
-        // รูปภาพเก็บแยก 1 รูป = 1 เอกสาร ใน subcollection "images" (กันเอกสารหลักเกิน 1MB ของ Firestore)
+        // รูปภาพแบบเก็บใน Firebase: 1 รูป = 1 เอกสาร ใน subcollection "images" (กันเอกสารหลักเกิน 1MB ของ Firestore)
         const imagesCol = (db, appId, auditId) => collection(db, 'artifacts', appId, 'public', 'data', 'audits', auditId, 'images');
 
         const saveImages = async (db, appId, auditId, images) => {
@@ -132,7 +162,7 @@
                const { db, userId, appId } = await getFirebaseInstances();
                if (!db) throw new Error("ไม่สามารถเชื่อมต่อฐานข้อมูลได้");
 
-               // ล้างรูปเก่าที่เคยฝังอยู่ในเอกสารหลัก (ข้อมูลรุ่นก่อน) ให้ไปอยู่ใน subcollection แทน
+               // ล้างรูปเก่าที่เคยฝังอยู่ในเอกสารหลัก (ข้อมูลรุ่นก่อน)
                const body = { ...data, images: {} };
                const imageCount = Object.keys(images).length;
 
@@ -148,7 +178,39 @@
                }
 
                if (onProgress) onProgress(`กำลังอัปโหลดรูปภาพ (${imageCount} รูป)...\nกรุณาอย่าปิดหน้าจอ`);
-               await saveImages(db, appId, auditId, images);
+               const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'audits', auditId);
+               if (useDrive()) {
+                   // ตอนแก้ไข ใช้โฟลเดอร์เดิมที่จำไว้ (สคริปต์จะเปลี่ยนชื่อให้ตรงกับข้อมูลล่าสุด)
+                   const existing = docId ? (await getDoc(docRef)).data() : null;
+                   const folderInfo = { auditId, folderId: existing?.driveFolderId || '', ...driveFolderNames(data.storeInfo) };
+                   let folderId = '';
+                   try {
+                       folderId = (await callImageScript({ action: 'prepare', ...folderInfo })).folderId;
+                   } catch (e) {
+                       // Apps Script รุ่นเก่ายังไม่มีคำสั่ง prepare: ส่งรูปทั้งหมดในคำสั่งเดียวแบบเดิม
+                       if (!String(e.message).includes('ไม่รู้จักคำสั่ง')) throw e;
+                       folderId = (await callImageScript({ action: 'save', ...folderInfo, images })).folderId || '';
+                       folderInfo.legacy = true;
+                   }
+                   if (!folderInfo.legacy) {
+                       // ส่งรูปพร้อมกันครั้งละ 6 รูป (Apps Script รันพร้อมกันได้จำกัด)
+                       const entries = Object.entries(images);
+                       let done = 0;
+                       for (let i = 0; i < entries.length; i += 6) {
+                           await Promise.all(entries.slice(i, i + 6).map(async ([itemId, imgData]) => {
+                               await callImageScript({ action: 'upload', auditId, folderId, itemId, data: imgData });
+                               done++;
+                               if (onProgress) onProgress(`กำลังอัปโหลดรูปภาพ... (${done}/${entries.length})\nกรุณาอย่าปิดหน้าจอ`);
+                           }));
+                       }
+                   }
+                   await updateDoc(docRef, { imagesInDrive: true, ...(folderId ? { driveFolderId: folderId } : {}) });
+                   // ลบรูปที่อาจค้างอยู่ใน Firebase จากการบันทึกรุ่นก่อน
+                   await saveImages(db, appId, auditId, {});
+               } else {
+                   await saveImages(db, appId, auditId, images);
+                   if (docId) await updateDoc(docRef, { imagesInDrive: false });
+               }
                return auditId;
             } catch (error) {
                console.error("Firebase Save Error:", error);
@@ -156,15 +218,20 @@
             }
         };
 
-        window.fetchAuditImages = async (docId) => {
+        window.fetchAuditImages = async (docId, imagesInDrive = false, driveFolderId = '') => {
             try {
+               if (imagesInDrive) {
+                   if (!useDrive()) return {};
+                   const result = await callImageScript({ action: 'load', auditId: docId, folderId: driveFolderId || '' });
+                   return result.images || {};
+               }
                const { db, appId } = await getFirebaseInstances();
                const snapshot = await getDocs(imagesCol(db, appId, docId));
                const result = {};
                snapshot.forEach(d => { result[d.id] = d.data().data; });
                return result;
             } catch (error) {
-               console.error("Firebase Image Fetch Error:", error);
+               console.error("Image Fetch Error:", error);
                return {};
             }
         };
@@ -173,6 +240,13 @@
             try {
                const { db, appId } = await getFirebaseInstances();
                if (!db) throw new Error("ไม่สามารถเชื่อมต่อฐานข้อมูลได้");
+               if (useDrive()) {
+                   try {
+                       const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'audits', docId));
+                       await callImageScript({ action: 'delete', auditId: docId, folderId: snap.data()?.driveFolderId || '' });
+                   }
+                   catch (e) { console.warn("Drive delete failed", e); }
+               }
                const imgs = await getDocs(imagesCol(db, appId, docId));
                await Promise.all(imgs.docs.map(d => deleteDoc(d.ref)));
                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'audits', docId);
@@ -184,15 +258,24 @@
             }
         };
 
-        window.fetchAuditHistory = async () => {
+        // months = null ดึงทั้งหมด, หรือส่งรายการเดือน เช่น ['2026-10'] เพื่อดึงเฉพาะเดือนนั้น (ประหยัดโควตาการอ่าน)
+        window.fetchAuditHistory = async (months = null) => {
             try {
                const { db, appId } = await getFirebaseInstances();
                if (!db) return [];
 
                const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'audits');
-               const snapshot = await getDocs(colRef);
+               const snapshots = [];
+               if (months === null) {
+                   snapshots.push(await getDocs(colRef));
+               } else {
+                   // where 'in' รับได้ครั้งละไม่เกิน 30 ค่า
+                   for (let i = 0; i < months.length; i += 30) {
+                       snapshots.push(await getDocs(query(colRef, where('month', 'in', months.slice(i, i + 30)))));
+                   }
+               }
                const data = [];
-               snapshot.forEach(doc => data.push({ id: doc.id, ...doc.data() }));
+               snapshots.forEach(snapshot => snapshot.forEach(doc => data.push({ id: doc.id, ...doc.data() })));
                return data.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
             } catch (error) {
                console.error("Firebase Fetch Error:", error.message);
@@ -298,7 +381,7 @@
                 if(readOnlyImage) return;
                 if (isDrawing) {
                     setIsDrawing(false);
-                    onSignatureChange(canvasRef.current.toDataURL('image/png'));
+                    onSignatureChange(canvasRef.current.toDataURL('image/jpeg', 0.7));
                 }
             };
 
@@ -579,7 +662,6 @@
             const [isSaving, setIsSaving] = React.useState(false);
             const [modalInfo, setModalInfo] = React.useState({ show: false, message: '', isError: false });
             const [hasDraft, setHasDraft] = React.useState(false);
-            const [isDataLoaded, setIsDataLoaded] = React.useState(false);
 
             const [lastAutoSave, setLastAutoSave] = React.useState(null);
 
@@ -757,28 +839,65 @@
                 setCurrentPage(1);
             }, [filterMonth, filterSearch, filterDept, filterRegion, filterScore, filterStatus]);
 
-            const loadAuditHistory = async (forceRefresh = false) => {
-                if (isDataLoaded && !forceRefresh) return;
+            // ====== โหลดประวัติแบบรายเดือน (ประหยัดโควตาการอ่านของ Firebase แพ็กเกจฟรี) ======
+            // เก็บว่าเดือนไหนโหลดมาแล้ว จะได้ไม่อ่านซ้ำ
+            const loadedMonthsRef = React.useRef(new Set());
+            const loadedAllRef = React.useRef(false);
+            const [historyVersion, setHistoryVersion] = React.useState(0);
+
+            const shiftMonth = (yyyy_mm, delta) => {
+                const [y, m] = yyyy_mm.split('-').map(Number);
+                const d = new Date(y, m - 1 + delta, 1);
+                return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+            };
+            const lastNMonths = (n) => Array.from({ length: n }, (_, i) => shiftMonth(currentYYYY_MM, -i));
+
+            // เดือนที่หน้าปัจจุบันต้องใช้ (null = ทุกเดือน)
+            // หน้าวิเคราะห์ต้องใช้เดือนก่อนหน้าด้วย เพื่อเทียบเดือนต่อเดือนและหาข้อบกพร่องซ้ำซาก
+            const getNeededMonths = () => {
+                if (filterMonth === '') return null;
+                return currentView === 'analysis' ? [filterMonth, shiftMonth(filterMonth, -1)] : [filterMonth];
+            };
+
+            const loadAuditHistory = async (forceRefresh = false, months = getNeededMonths()) => {
+                if (!window.fetchAuditHistory) return;
+                if (loadedAllRef.current && !forceRefresh) return;
+                if (months !== null) {
+                    if (!forceRefresh) months = months.filter(m => !loadedMonthsRef.current.has(m));
+                    if (months.length === 0) return;
+                }
                 setIsLoadingHistory(true);
-                if (window.fetchAuditHistory) {
-                    const data = await window.fetchAuditHistory();
+                const data = await window.fetchAuditHistory(months);
+                if (months === null) {
+                    loadedAllRef.current = true;
                     setAuditHistory(data);
-                    setIsDataLoaded(true);
+                } else {
+                    months.forEach(m => loadedMonthsRef.current.add(m));
+                    setAuditHistory(prev => [...prev.filter(r => !months.includes(r.month)), ...data]
+                        .sort((x, y) => new Date(y.createdAt) - new Date(x.createdAt)));
                 }
                 setIsLoadingHistory(false);
             };
 
+            // ล้างแคชประวัติ แล้วให้หน้าสรุป/วิเคราะห์โหลดใหม่เมื่อเปิด
+            const invalidateHistory = () => {
+                loadedMonthsRef.current = new Set();
+                loadedAllRef.current = false;
+                setAuditHistory([]);
+                setHistoryVersion(v => v + 1);
+            };
+
             React.useEffect(() => {
-                if ((currentView === 'dashboard' || currentView === 'analysis') && !viewingRecord && !isDataLoaded) {
+                if ((currentView === 'dashboard' || currentView === 'analysis') && !viewingRecord) {
                     loadAuditHistory();
                 }
-            }, [currentView, viewingRecord, isDataLoaded]);
+            }, [currentView, viewingRecord, filterMonth, historyVersion]);
 
-            // ดึงรูปของผลการตรวจจาก subcollection (รองรับข้อมูลเก่าที่เก็บรูปไว้ในเอกสารหลักด้วย)
+            // ดึงรูปของผลการตรวจ (Google Drive หรือ Firebase) รองรับข้อมูลเก่าที่เก็บรูปไว้ในเอกสารหลักด้วย
             const loadRecordImages = async (record) => {
                 let imgs = record.images || {};
                 if (window.fetchAuditImages && record.id) {
-                    const ext = await window.fetchAuditImages(record.id);
+                    const ext = await window.fetchAuditImages(record.id, !!record.imagesInDrive, record.driveFolderId);
                     imgs = { ...imgs, ...ext };
                 }
                 return imgs;
@@ -925,8 +1044,8 @@
                             const canvas = document.createElement('canvas');
                             let width = img.width;
                             let height = img.height;
-                            const MAX_WIDTH = 800;
-                            const MAX_HEIGHT = 800;
+                            const MAX_WIDTH = 640;
+                            const MAX_HEIGHT = 640;
 
                             if (width > height) {
                                 if (width > MAX_WIDTH) { height *= MAX_WIDTH / width; width = MAX_WIDTH; }
@@ -938,7 +1057,7 @@
                             const ctx = canvas.getContext('2d');
                             ctx.drawImage(img, 0, 0, width, height);
 
-                            const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.6);
+                            const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.5);
                             setImages(prev => ({ ...prev, [itemId]: compressedDataUrl }));
                             setImageLoading(prev => ({ ...prev, [itemId]: false })); // ปิด Loading
 
@@ -1434,8 +1553,8 @@
                         setIsSaving(false);
                         setModalInfo({ show: true, message: 'อัปโหลดไฟล์และบันทึกข้อมูลสำเร็จ!', isError: false });
                         setEditingId(null);
-                        // ไม่รอโหลดประวัติทั้งหมดตรงนี้ (ช้าเมื่อข้อมูลเยอะ) แต่ให้โหลดใหม่ตอนเปิดหน้าสรุปภาพรวม/วิเคราะห์
-                        setIsDataLoaded(false);
+                        // ไม่รอโหลดประวัติตรงนี้ (ช้าเมื่อข้อมูลเยอะ) แต่ให้โหลดใหม่ตอนเปิดหน้าสรุปภาพรวม/วิเคราะห์
+                        invalidateHistory();
                     } else throw new Error("ระบบฐานข้อมูลยังไม่พร้อมใช้งาน");
                 } catch (error) {
                     setModalInfo({ show: true, message: `เกิดข้อผิดพลาด: ${error.message}`, isError: true });
@@ -1675,7 +1794,8 @@
             };
 
             const dashboardData = React.useMemo(() => {
-                const availableMonths = [...new Set(auditHistory.map(r => r.month))].filter(Boolean).sort().reverse();
+                // แสดง 12 เดือนล่าสุดเสมอ เพราะประวัติโหลดมาเฉพาะเดือนที่เลือก
+                const availableMonths = [...new Set([...lastNMonths(12), ...auditHistory.map(r => r.month)])].filter(Boolean).sort().reverse();
 
                 const auditMap = {};
                 auditHistory.forEach(record => {
@@ -2217,10 +2337,18 @@
                             </div>
 
                             <div className="bg-white p-5 md:p-6 rounded-xl border border-gray-100 mb-6 shadow-sm">
-                                <h3 className="text-sm font-bold text-gray-700 mb-6 flex items-center gap-2">
-                                    <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 8v8m-4-5v5m-4-2v2m-2 4h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
-                                    แนวโน้มคะแนนเฉลี่ยรายเดือน (6 เดือนล่าสุด)
-                                </h3>
+                                <div className="flex flex-col md:flex-row md:justify-between md:items-center gap-2 mb-6">
+                                    <h3 className="text-sm font-bold text-gray-700 flex items-center gap-2">
+                                        <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M16 8v8m-4-5v5m-4-2v2m-2 4h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                                        แนวโน้มคะแนนเฉลี่ยรายเดือน (6 เดือนล่าสุด)
+                                    </h3>
+                                    {/* โหลดข้อมูล 6 เดือนเมื่อกดเท่านั้น เพื่อประหยัดโควตาการอ่านของ Firebase */}
+                                    {!(loadedAllRef.current || lastNMonths(6).every(m => loadedMonthsRef.current.has(m))) && (
+                                        <button onClick={() => loadAuditHistory(false, lastNMonths(6))} disabled={isLoadingHistory} className="text-xs bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg border border-blue-200 hover:bg-blue-100 transition shadow-sm font-bold disabled:opacity-50 self-start md:self-auto">
+                                            {isLoadingHistory ? 'กำลังโหลด...' : 'โหลดกราฟ 6 เดือน'}
+                                        </button>
+                                    )}
+                                </div>
                                 {monthlyChartData.length > 0 ? (
                                     <div className="flex items-end justify-around gap-2 h-44 relative border-b-2 border-gray-200 pb-1 mx-2 md:mx-6">
                                         <div className="absolute w-full border-t border-dashed border-gray-200 bottom-[50%] z-0 flex items-end">
