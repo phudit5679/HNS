@@ -96,7 +96,7 @@
 
     <script type="module">
         import { initializeApp, getApps, getApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-        import { getFirestore, collection, addDoc, getDocs, doc, updateDoc, deleteDoc, setDoc, query, where } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        import { getFirestore, collection, addDoc, getDocs, getDoc, doc, updateDoc, deleteDoc, setDoc, query, where } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 
         // ====== ตั้งค่าที่เก็บรูปบน Google Drive (ผ่าน Google Apps Script) ======
         // วางลิงก์ Web app ของ Apps Script และรหัสลับ (TOKEN) ให้ตรงกับในสคริปต์
@@ -115,6 +115,17 @@
             const result = await res.json();
             if (!result.ok) throw new Error(`Google Drive: ${result.error || 'ไม่ทราบสาเหตุ'}`);
             return result;
+        };
+
+        // ชื่อโฟลเดอร์ใน Drive: "2569-10 ต.ค." / "S001 สาขาบางนา 15-10-2569"
+        const THAI_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+        const driveFolderNames = (storeInfo = {}) => {
+            const [y, m, d] = String(storeInfo.date || '').split('-');
+            const thaiYear = y ? parseInt(y, 10) + 543 : '';
+            const folderName = [storeInfo.code, storeInfo.name, d && m ? `${d}-${m}-${thaiYear}` : '']
+                .filter(Boolean).join(' ').replace(/[\\/]/g, '-');
+            const monthFolderName = y && m ? `${thaiYear}-${m} ${THAI_MONTHS[parseInt(m, 10) - 1]}` : '';
+            return { folderName, monthFolderName };
         };
 
         const getFirebaseInstances = async () => {
@@ -169,8 +180,14 @@
                if (onProgress) onProgress(`กำลังอัปโหลดรูปภาพ (${imageCount} รูป)...\nกรุณาอย่าปิดหน้าจอ`);
                const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'audits', auditId);
                if (useDrive()) {
-                   await callImageScript({ action: 'save', auditId, images });
-                   await updateDoc(docRef, { imagesInDrive: true });
+                   // ตอนแก้ไข ใช้โฟลเดอร์เดิมที่จำไว้ (สคริปต์จะเปลี่ยนชื่อให้ตรงกับข้อมูลล่าสุด)
+                   const existing = docId ? (await getDoc(docRef)).data() : null;
+                   const result = await callImageScript({
+                       action: 'save', auditId, images,
+                       folderId: existing?.driveFolderId || '',
+                       ...driveFolderNames(data.storeInfo)
+                   });
+                   await updateDoc(docRef, { imagesInDrive: true, ...(result.folderId ? { driveFolderId: result.folderId } : {}) });
                    // ลบรูปที่อาจค้างอยู่ใน Firebase จากการบันทึกรุ่นก่อน
                    await saveImages(db, appId, auditId, {});
                } else {
@@ -184,11 +201,11 @@
             }
         };
 
-        window.fetchAuditImages = async (docId, imagesInDrive = false) => {
+        window.fetchAuditImages = async (docId, imagesInDrive = false, driveFolderId = '') => {
             try {
                if (imagesInDrive) {
                    if (!useDrive()) return {};
-                   const result = await callImageScript({ action: 'load', auditId: docId });
+                   const result = await callImageScript({ action: 'load', auditId: docId, folderId: driveFolderId || '' });
                    return result.images || {};
                }
                const { db, appId } = await getFirebaseInstances();
@@ -207,7 +224,10 @@
                const { db, appId } = await getFirebaseInstances();
                if (!db) throw new Error("ไม่สามารถเชื่อมต่อฐานข้อมูลได้");
                if (useDrive()) {
-                   try { await callImageScript({ action: 'delete', auditId: docId }); }
+                   try {
+                       const snap = await getDoc(doc(db, 'artifacts', appId, 'public', 'data', 'audits', docId));
+                       await callImageScript({ action: 'delete', auditId: docId, folderId: snap.data()?.driveFolderId || '' });
+                   }
                    catch (e) { console.warn("Drive delete failed", e); }
                }
                const imgs = await getDocs(imagesCol(db, appId, docId));
@@ -860,7 +880,7 @@
             const loadRecordImages = async (record) => {
                 let imgs = record.images || {};
                 if (window.fetchAuditImages && record.id) {
-                    const ext = await window.fetchAuditImages(record.id, !!record.imagesInDrive);
+                    const ext = await window.fetchAuditImages(record.id, !!record.imagesInDrive, record.driveFolderId);
                     imgs = { ...imgs, ...ext };
                 }
                 return imgs;
