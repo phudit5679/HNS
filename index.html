@@ -106,25 +106,56 @@
         const useDrive = () => IMAGE_SCRIPT_URL !== '' && IMAGE_SCRIPT_TOKEN !== '';
 
         // ส่งเป็น text/plain เพื่อไม่ให้เบราว์เซอร์ส่ง preflight ซึ่ง Apps Script ไม่รองรับ
-        const callImageScript = async (payload) => {
-            const res = await fetch(IMAGE_SCRIPT_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-                body: JSON.stringify({ ...payload, token: IMAGE_SCRIPT_TOKEN })
-            });
-            const result = await res.json();
+        const callImageScriptOnce = async (payload) => {
+            let res;
+            try {
+                res = await fetch(IMAGE_SCRIPT_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                    body: JSON.stringify({ ...payload, token: IMAGE_SCRIPT_TOKEN })
+                });
+            } catch (e) {
+                const err = new Error(`เชื่อมต่อ Google Drive ไม่ได้ (${e.message}) กรุณาเช็กสัญญาณอินเทอร์เน็ต`);
+                err.transient = true;
+                throw err;
+            }
+            const text = await res.text();
+            let result;
+            try {
+                result = JSON.parse(text);
+            } catch (e) {
+                // Apps Script ตอบเป็นหน้าเว็บแทน JSON: Google ขัดข้องชั่วคราว, สคริปต์มี error, ยังไม่ได้ Authorize หรือตั้งสิทธิ์ไม่เป็น Anyone
+                const page = new DOMParser().parseFromString(text, 'text/html');
+                const detail = (page.querySelector('.errorMessage')?.textContent || page.title || page.body?.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200);
+                const err = new Error(`Google Drive (Apps Script) ตอบกลับผิดรูปแบบ: ${detail || `HTTP ${res.status}`}\nกรุณาเช็ก Apps Script → การดำเนินการ (Executions)`);
+                err.transient = true;
+                throw err;
+            }
             if (!result.ok) throw new Error(`Google Drive: ${result.error || 'ไม่ทราบสาเหตุ'}`);
             return result;
         };
 
-        // ชื่อโฟลเดอร์ใน Drive: "2569-10 ต.ค." / "S001 สาขาบางนา 15-10-2569"
-        const THAI_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+        // Apps Script บริการฟรีขัดข้องชั่วคราวได้บ้าง (เช่น ตอนเพิ่งตื่นจากการพัก) จึงลองใหม่อัตโนมัติสูงสุด 2 ครั้ง
+        // ไม่ลองใหม่เมื่อสคริปต์ตอบ error ชัดเจน (เช่น รหัสลับผิด) เพราะลองกี่ครั้งก็ไม่ผ่าน
+        const callImageScript = async (payload) => {
+            for (let attempt = 0; ; attempt++) {
+                try {
+                    return await callImageScriptOnce(payload);
+                } catch (e) {
+                    if (!e.transient || attempt >= 2) throw e;
+                    await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+                }
+            }
+        };
+
+        // ชื่อโฟลเดอร์ใน Drive: "ตุลาคม 2569" / "S001 สาขาบางนา 15-10-2569"
+        const THAI_MONTHS = ["มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"];
         const driveFolderNames = (storeInfo = {}) => {
             const [y, m, d] = String(storeInfo.date || '').split('-');
             const thaiYear = y ? parseInt(y, 10) + 543 : '';
             const folderName = [storeInfo.code, storeInfo.name, d && m ? `${d}-${m}-${thaiYear}` : '']
                 .filter(Boolean).join(' ').replace(/[\\/]/g, '-');
-            const monthFolderName = y && m ? `${thaiYear}-${m} ${THAI_MONTHS[parseInt(m, 10) - 1]}` : '';
+            const monthFolderName = y && m ? `${THAI_MONTHS[parseInt(m, 10) - 1]} ${thaiYear}` : '';
             return { folderName, monthFolderName };
         };
 
@@ -158,6 +189,7 @@
         };
 
         window.initFirebaseAndSave = async (data, docId = null, images = {}, onProgress = null) => {
+            let auditId = docId;
             try {
                const { db, userId, appId } = await getFirebaseInstances();
                if (!db) throw new Error("ไม่สามารถเชื่อมต่อฐานข้อมูลได้");
@@ -167,7 +199,6 @@
                const imageCount = Object.keys(images).length;
 
                if (onProgress) onProgress('กำลังบันทึกข้อมูลคะแนนลงระบบ...');
-               let auditId = docId;
                if (docId) {
                    const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'audits', docId);
                    await updateDoc(docRef, { ...body, updatedBy: userId, updatedAt: new Date().toISOString() });
@@ -192,6 +223,8 @@
                        folderId = (await callImageScript({ action: 'save', ...folderInfo, images })).folderId || '';
                        folderInfo.legacy = true;
                    }
+                   // จำโฟลเดอร์ไว้ทันที ถ้าอัปโหลดรูปล้มเหลวแล้วกดลองใหม่ จะใช้โฟลเดอร์เดิม ไม่สร้างซ้ำ
+                   if (folderId) await updateDoc(docRef, { driveFolderId: folderId });
                    if (!folderInfo.legacy) {
                        // ส่งรูปพร้อมกันครั้งละ 6 รูป (Apps Script รันพร้อมกันได้จำกัด)
                        const entries = Object.entries(images);
@@ -214,6 +247,8 @@
                return auditId;
             } catch (error) {
                console.error("Firebase Save Error:", error);
+               // แจ้งรหัสรายการที่สร้างไปแล้ว ให้หน้าเว็บบันทึกทับรายการเดิมตอนลองใหม่
+               error.auditId = auditId;
                throw error;
             }
         };
@@ -664,6 +699,8 @@
             const [hasDraft, setHasDraft] = React.useState(false);
 
             const [lastAutoSave, setLastAutoSave] = React.useState(null);
+            // เปลี่ยนค่าทุกครั้งที่ล้างฟอร์ม เพื่อสร้างช่องเซ็นชื่อใหม่ (ภาพลายเซ็นเก่าจะได้ไม่ค้างบนจอ)
+            const [formKey, setFormKey] = React.useState(0);
 
             const latestDataRef = React.useRef({ storeInfo, scores, remarks, measurements, checkedItems, signatures, images, auditStartTime, editingId });
             // ลายนิ้วมือของข้อมูลที่บันทึกขึ้น Cloud ล่าสุด ใช้กัน Auto Save สร้าง draft ซ้ำหลังบันทึกสำเร็จ
@@ -1551,13 +1588,19 @@
                         lastCloudSaveRef.current = getDataFingerprint({ storeInfo, scores, remarks, measurements, checkedItems, signatures, images });
                         setHasDraft(false);
                         setIsSaving(false);
-                        setModalInfo({ show: true, message: 'อัปโหลดไฟล์และบันทึกข้อมูลสำเร็จ!', isError: false });
-                        setEditingId(null);
+                        setModalInfo({ show: true, message: 'อัปโหลดไฟล์และบันทึกข้อมูลสำเร็จ!\n\nล้างฟอร์มแล้ว พร้อมตรวจสาขาถัดไป\n(ดูหรือดาวน์โหลด PDF ได้ที่หน้าสรุปภาพรวม)', isError: false });
+                        // ล้างฟอร์มหลังบันทึกสำเร็จ กันกดบันทึกซ้ำแล้วได้รายการและโฟลเดอร์รูปซ้ำ (เก็บชื่อผู้ตรวจไว้)
+                        const auditorName = storeInfo.auditor;
+                        resetForm();
+                        setStoreInfo(prev => ({ ...prev, auditor: auditorName }));
+                        fetchLocation();
                         // ไม่รอโหลดประวัติตรงนี้ (ช้าเมื่อข้อมูลเยอะ) แต่ให้โหลดใหม่ตอนเปิดหน้าสรุปภาพรวม/วิเคราะห์
                         invalidateHistory();
                     } else throw new Error("ระบบฐานข้อมูลยังไม่พร้อมใช้งาน");
                 } catch (error) {
-                    setModalInfo({ show: true, message: `เกิดข้อผิดพลาด: ${error.message}`, isError: true });
+                    // ถ้าระบบสร้างรายการไปแล้วแต่อัปโหลดรูปไม่สำเร็จ ให้การกดบันทึกครั้งถัดไปบันทึกทับรายการเดิม
+                    if (error.auditId) setEditingId(error.auditId);
+                    setModalInfo({ show: true, message: `เกิดข้อผิดพลาด: ${error.message}${error.auditId ? '\n\nกด "บันทึก" อีกครั้งเพื่อลองใหม่ ระบบจะบันทึกทับรายการเดิม ไม่สร้างซ้ำ' : ''}`, isError: true });
                 } finally {
                     setIsSaving(false);
                 }
@@ -1594,6 +1637,7 @@
                 setStoreInfo({ code: '', name: '', province: '', department: '', zone: '', auditor: '', date: currentDate, time: currentTime, storeType: 'out', latitude: '', longitude: '', mapLink: '' });
                 setScores({}); setRemarks({}); setMeasurements({}); setImages({}); setImageLoading({}); setCheckedItems({});
                 setSignatures({ manager: null, auditor: null }); setViewingRecord(null); setEditingId(null);
+                setFormKey(k => k + 1);
                 setAuditStartTime(Date.now()); setCurrentView('form'); window.scrollTo(0, 0);
             };
 
@@ -2302,6 +2346,7 @@
                 });
                 setScores({}); setRemarks({}); setMeasurements({}); setImages({}); setCheckedItems({});
                 setSignatures({ manager: null, auditor: null }); setViewingRecord(null); setEditingId(null);
+                setFormKey(k => k + 1);
                 setAuditStartTime(Date.now()); setCurrentView('form'); window.scrollTo(0, 0);
             };
 
@@ -3697,8 +3742,8 @@
                             </div>
 
                             <div id="section-signature" className="mt-8 md:mt-16 grid grid-cols-1 md:grid-cols-2 gap-6 md:gap-10 pt-6 md:pt-10 border-t-2 border-gray-300 page-break-inside-avoid scroll-mt-6 w-full">
-                                <SignaturePad title="ลงชื่อ ผู้จัดการร้านสาขา (ผู้รับทราบ)" onSignatureChange={(dataUrl) => setSignatures({...signatures, manager: dataUrl})} readOnlyImage={viewingRecord ? signatures.manager : null} />
-                                <SignaturePad title="ลงชื่อ ผู้จัดการเขต (ผู้ตรวจ)" onSignatureChange={(dataUrl) => setSignatures({...signatures, auditor: dataUrl})} readOnlyImage={viewingRecord ? signatures.auditor : null} />
+                                <SignaturePad key={`manager-${formKey}`} title="ลงชื่อ ผู้จัดการร้านสาขา (ผู้รับทราบ)" onSignatureChange={(dataUrl) => setSignatures({...signatures, manager: dataUrl})} readOnlyImage={viewingRecord ? signatures.manager : null} />
+                                <SignaturePad key={`auditor-${formKey}`} title="ลงชื่อ ผู้จัดการเขต (ผู้ตรวจ)" onSignatureChange={(dataUrl) => setSignatures({...signatures, auditor: dataUrl})} readOnlyImage={viewingRecord ? signatures.auditor : null} />
                             </div>
 
                             {!viewingRecord && (
