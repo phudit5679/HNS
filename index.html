@@ -148,14 +148,14 @@
             }
         };
 
-        // ชื่อโฟลเดอร์ใน Drive: "2569-10 ต.ค." / "S001 สาขาบางนา 15-10-2569"
-        const THAI_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
+        // ชื่อโฟลเดอร์ใน Drive: "ตุลาคม 2569" / "S001 สาขาบางนา 15-10-2569"
+        const THAI_MONTHS = ["มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน", "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม"];
         const driveFolderNames = (storeInfo = {}) => {
             const [y, m, d] = String(storeInfo.date || '').split('-');
             const thaiYear = y ? parseInt(y, 10) + 543 : '';
             const folderName = [storeInfo.code, storeInfo.name, d && m ? `${d}-${m}-${thaiYear}` : '']
                 .filter(Boolean).join(' ').replace(/[\\/]/g, '-');
-            const monthFolderName = y && m ? `${thaiYear}-${m} ${THAI_MONTHS[parseInt(m, 10) - 1]}` : '';
+            const monthFolderName = y && m ? `${THAI_MONTHS[parseInt(m, 10) - 1]} ${thaiYear}` : '';
             return { folderName, monthFolderName };
         };
 
